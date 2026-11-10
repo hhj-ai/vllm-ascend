@@ -768,31 +768,33 @@ def make_dynamic_ntk_alpha_embedding(patch_init_side_effects):
     return _factory
 
 
-class TestAscendDynamicNTKRotaryEmbeddingRegistration:
+class TestAscendDynamicNTKRotaryEmbedding:
     """Both dynamic NTK variants must reach the NPU rope kernel.
 
     `CustomOp.__new__` resolves the out-of-tree replacement by class name, so a
     scaled rope variant missing from `REGISTERED_ASCEND_OPS` silently keeps
-    running `forward_native`. InternLM2 declares `rope_scaling.type=dynamic`
-    with a `factor`; Hunyuan declares one with an `alpha`.
+    running `forward_native` on the NPU. InternLM2 declares
+    `rope_scaling.type=dynamic` with a `factor`; Hunyuan declares one with an
+    `alpha`. Both used to fall through.
     """
 
-    @pytest.mark.parametrize(
-        "op_name, expected_cls",
-        [
-            ("DynamicNTKScalingRotaryEmbedding", AscendDynamicNTKScalingRotaryEmbedding),
-            ("DynamicNTKAlphaRotaryEmbedding", AscendDynamicNTKAlphaRotaryEmbedding),
-        ],
-    )
-    def test_registered_under_upstream_class_name(self, op_name, expected_cls):
-        from vllm_ascend.utils import register_ascend_customop
+    @staticmethod
+    def _vllm_config():
+        vllm_config = MagicMock()
+        vllm_config.compilation_config.custom_ops = ["all"]
+        return vllm_config
 
-        with patch("vllm_ascend.utils.get_current_vllm_config", return_value=None):
-            register_ascend_customop()
+    def test_scaling_variant_resolves_to_ascend_override(self):
+        with set_current_vllm_config(self._vllm_config()):
+            emb = DynamicNTKScalingRotaryEmbedding(HEAD_SIZE, ROTARY_DIM, MAX_POS, MAX_POS, BASE, True, 2.0, DTYPE)
 
-        from vllm_ascend import utils as ascend_utils
+        assert isinstance(emb, AscendDynamicNTKScalingRotaryEmbedding)
 
-        assert ascend_utils.REGISTERED_ASCEND_OPS[op_name] is expected_cls
+    def test_alpha_variant_resolves_to_ascend_override(self):
+        with set_current_vllm_config(self._vllm_config()):
+            emb = DynamicNTKAlphaRotaryEmbedding(HEAD_SIZE, ROTARY_DIM, MAX_POS, BASE, True, 2.0, DTYPE)
+
+        assert isinstance(emb, AscendDynamicNTKAlphaRotaryEmbedding)
 
     @pytest.mark.parametrize(
         "ascend_cls, upstream_cls",
@@ -813,23 +815,22 @@ class TestAscendDynamicNTKRotaryEmbeddingRegistration:
                 f"{ascend_cls.__name__} overrides {hook}; the Ascend subclass must only swap the forward."
             )
 
-
-class TestAscendDynamicNTKRotaryEmbeddingCache:
-    """The inherited cache must still match the HF dynamic NTK formula."""
-
     def test_scaling_cache_matches_reference_formula(self):
-        cache = DynamicNTKScalingRotaryEmbedding(
-            HEAD_SIZE, ROTARY_DIM, MAX_POS, MAX_POS, BASE, True, 2.0, torch.float32
-        )._compute_cos_sin_cache()
+        """The inherited cache still has to match the HF dynamic NTK formula."""
+        with set_current_vllm_config(self._vllm_config()):
+            emb = DynamicNTKScalingRotaryEmbedding(
+                HEAD_SIZE, ROTARY_DIM, MAX_POS, MAX_POS, BASE, True, 2.0, torch.float32
+            )
+
         expected = _reference_dynamic_ntk_cache(ROTARY_DIM, MAX_POS, MAX_POS, BASE, 2.0)
-        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+        torch.testing.assert_close(emb.cos_sin_cache, expected, rtol=0, atol=0)
 
     def test_alpha_cache_matches_reference_formula(self):
-        cache = DynamicNTKAlphaRotaryEmbedding(
-            HEAD_SIZE, ROTARY_DIM, MAX_POS, BASE, True, 2.0, torch.float32
-        )._compute_cos_sin_cache()
+        with set_current_vllm_config(self._vllm_config()):
+            emb = DynamicNTKAlphaRotaryEmbedding(HEAD_SIZE, ROTARY_DIM, MAX_POS, BASE, True, 2.0, torch.float32)
+
         expected = _reference_dynamic_ntk_alpha_cache(ROTARY_DIM, MAX_POS, BASE, 2.0)
-        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+        torch.testing.assert_close(emb.cos_sin_cache, expected, rtol=0, atol=0)
 
     def test_untrained_scaling_factor_leaves_base_untouched(self):
         """`max_trained_positions == max_position` must be a no-op correction.
@@ -837,14 +838,16 @@ class TestAscendDynamicNTKRotaryEmbeddingCache:
         This is the InternLM2-20B-Chat case: `factor=2.0` with no
         `max_trained_positions`, so `get_rope` defaults it to `max_position`
         and the correction term collapses to 1. The cache then has to equal a
-        plain RoPE cache at the same theta, which is what makes a 32K serve
-        numerically equivalent to the unscaled model.
+        plain RoPE cache at the same theta, which is what makes the declared
+        32K context numerically equivalent to the unscaled model.
         """
-        scaled = DynamicNTKScalingRotaryEmbedding(
-            HEAD_SIZE, ROTARY_DIM, MAX_POS, MAX_POS, BASE, True, 2.0, torch.float32
-        )._compute_cos_sin_cache()
-        plain = RotaryEmbedding(HEAD_SIZE, ROTARY_DIM, MAX_POS, BASE, True, torch.float32)._compute_cos_sin_cache()
-        torch.testing.assert_close(scaled, plain, rtol=0, atol=0)
+        with set_current_vllm_config(self._vllm_config()):
+            scaled = DynamicNTKScalingRotaryEmbedding(
+                HEAD_SIZE, ROTARY_DIM, MAX_POS, MAX_POS, BASE, True, 2.0, torch.float32
+            )
+            plain = RotaryEmbedding(HEAD_SIZE, ROTARY_DIM, MAX_POS, BASE, True, torch.float32)
+
+        torch.testing.assert_close(scaled.cos_sin_cache, plain.cos_sin_cache, rtol=0, atol=0)
 
 
 class TestAscendDynamicNTKScalingRotaryEmbeddingForwardOOT:
