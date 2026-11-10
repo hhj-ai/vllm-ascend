@@ -26,6 +26,8 @@ from vllm.forward_context import is_forward_context_available
 from vllm.logger import logger
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
+    DynamicNTKAlphaRotaryEmbedding,
+    DynamicNTKScalingRotaryEmbedding,
     Gemma4RotaryEmbedding,
     MRotaryEmbedding,
     RotaryEmbedding,
@@ -400,6 +402,111 @@ class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
         )
         vllm_config = get_current_vllm_config()
         self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
+        _record_cos_sin_cache(self.cos_sin_cache)
+
+    def forward_oot(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: torch.Tensor | None = None,
+        is_neox_style_override: bool | None = None,
+        out_dtype: torch.dtype | None = None,
+    ):
+        return AscendRotaryEmbedding.forward_oot(
+            self,
+            positions,
+            query,
+            key,
+            offsets,
+            is_neox_style_override,
+            out_dtype,
+        )
+
+
+class AscendDynamicNTKScalingRotaryEmbedding(DynamicNTKScalingRotaryEmbedding):
+    """Dynamic NTK scaled RoPE (`rope_scaling.type == "dynamic"`, `factor`).
+
+    Subclasses rather than reusing `AscendRotaryEmbedding` so the parent keeps
+    building the cos/sin cache: the NTK correction lives entirely in
+    `_compute_cos_sin_cache`, which rescales `base` once at init. Only the
+    forward is swapped, so the cache stays bit-identical to the upstream one
+    and the NPU kernel replaces the `forward_native` elementwise chain.
+
+    Used by InternLM2/InternLM2.5 and every other checkpoint declaring a
+    dynamic `factor`.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        max_trained_positions: int,
+        base: float,
+        is_neox_style: bool,
+        scaling_factor: float,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__(
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            max_trained_positions,
+            base,
+            is_neox_style,
+            scaling_factor,
+            dtype,
+        )
+        _record_cos_sin_cache(self.cos_sin_cache)
+
+    def forward_oot(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: torch.Tensor | None = None,
+        is_neox_style_override: bool | None = None,
+        out_dtype: torch.dtype | None = None,
+    ):
+        return AscendRotaryEmbedding.forward_oot(
+            self,
+            positions,
+            query,
+            key,
+            offsets,
+            is_neox_style_override,
+            out_dtype,
+        )
+
+
+class AscendDynamicNTKAlphaRotaryEmbedding(DynamicNTKAlphaRotaryEmbedding):
+    """Dynamic NTK RoPE parameterised by `alpha` instead of `factor`.
+
+    Same structure as `AscendDynamicNTKScalingRotaryEmbedding`: the alpha
+    correction is folded into `base` when the cache is built, so only the
+    forward needs the NPU kernel. Used by Hunyuan checkpoints.
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        scaling_alpha: float,
+        dtype: torch.dtype,
+    ) -> None:
+        super().__init__(
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            scaling_alpha,
+            dtype,
+        )
         _record_cos_sin_cache(self.cos_sin_cache)
 
     def forward_oot(
