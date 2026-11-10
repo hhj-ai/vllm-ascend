@@ -13,7 +13,7 @@ tasks:
 - name: "ceval-valid"
   metrics:
   - name: "acc,none"
-    value: PLACEHOLDER
+    value: 0.6293
 
 num_fewshot: 5
 apply_chat_template: false

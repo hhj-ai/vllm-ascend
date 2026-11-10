@@ -221,7 +221,7 @@ The configuration pins the parallelism, so no `--tp-size` is required. The test 
 
 | Dataset | Shots | Metric | Value |
 |---------|------:|--------|------:|
-| ceval-valid | 5 | acc,none | TBD |
+| ceval-valid | 5 | acc,none | 0.6293 |
 
 ## 8 Performance Evaluation
 
