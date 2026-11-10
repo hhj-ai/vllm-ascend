@@ -29,7 +29,9 @@ from vllm.model_executor.layers.rotary_embedding import (
     DynamicNTKAlphaRotaryEmbedding,
     DynamicNTKScalingRotaryEmbedding,
     Gemma4RotaryEmbedding,
+    Llama3RotaryEmbedding,
     MRotaryEmbedding,
+    NTKScalingRotaryEmbedding,
     RotaryEmbedding,
     YaRNScalingRotaryEmbedding,
 )
@@ -424,17 +426,52 @@ class AscendYaRNRotaryEmbedding(YaRNScalingRotaryEmbedding):
         )
 
 
-class AscendDynamicNTKScalingRotaryEmbedding(DynamicNTKScalingRotaryEmbedding):
-    """Dynamic NTK scaled RoPE (`rope_scaling.type == "dynamic"`, `factor`).
+class _AscendScaledRopeMixin:
+    """Route a scaled RoPE variant to the NPU rotary kernel.
 
-    Subclasses rather than reusing `AscendRotaryEmbedding` so the parent keeps
-    building the cos/sin cache: the NTK correction lives entirely in
-    `_compute_cos_sin_cache`, which rescales `base` once at init. Only the
-    forward is swapped, so the cache stays bit-identical to the upstream one
-    and the NPU kernel replaces the `forward_native` elementwise chain.
+    Every variant that mixes this in differs from `RotaryEmbedding` only in
+    how the cos/sin table is built: the scaling correction is folded into the
+    base or the inverse frequencies once, when `_compute_cos_sin_cache` runs
+    at init. Their forward is the inherited one, so swapping it for the fused
+    NPU kernel leaves the result defined by the upstream cache, which the
+    subclass must not touch.
 
-    Used by InternLM2/InternLM2.5 and every other checkpoint declaring a
-    dynamic `factor`.
+    Variants that do more than reshape the table are deliberately left out:
+    `Phi3LongRoPEScaledRotaryEmbedding` and `FourierRotaryEmbedding` override
+    the forward, and `LinearScalingRotaryEmbedding` indexes a concatenated
+    multi-factor cache through the `offsets` argument that `rope_forward_oot`
+    rejects.
+    """
+
+    def _init_ascend_rope(self) -> None:
+        vllm_config = get_current_vllm_config()
+        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
+        _record_cos_sin_cache(self.cos_sin_cache)
+
+    def forward_oot(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        offsets: torch.Tensor | None = None,
+        is_neox_style_override: bool | None = None,
+        out_dtype: torch.dtype | None = None,
+    ):
+        return AscendRotaryEmbedding.forward_oot(
+            self,
+            positions,
+            query,
+            key,
+            offsets,
+            is_neox_style_override,
+            out_dtype,
+        )
+
+
+class AscendDynamicNTKScalingRotaryEmbedding(_AscendScaledRopeMixin, DynamicNTKScalingRotaryEmbedding):
+    """Dynamic NTK scaled RoPE (`rope_scaling.type == "dynamic"` with `factor`).
+
+    Used by InternLM2 and InternLM2.5.
     """
 
     def __init__(
@@ -458,36 +495,13 @@ class AscendDynamicNTKScalingRotaryEmbedding(DynamicNTKScalingRotaryEmbedding):
             scaling_factor=scaling_factor,
             dtype=dtype,
         )
-        vllm_config = get_current_vllm_config()
-        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
-        _record_cos_sin_cache(self.cos_sin_cache)
-
-    def forward_oot(
-        self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor | None,
-        offsets: torch.Tensor | None = None,
-        is_neox_style_override: bool | None = None,
-        out_dtype: torch.dtype | None = None,
-    ):
-        return AscendRotaryEmbedding.forward_oot(
-            self,
-            positions,
-            query,
-            key,
-            offsets,
-            is_neox_style_override,
-            out_dtype,
-        )
+        self._init_ascend_rope()
 
 
-class AscendDynamicNTKAlphaRotaryEmbedding(DynamicNTKAlphaRotaryEmbedding):
+class AscendDynamicNTKAlphaRotaryEmbedding(_AscendScaledRopeMixin, DynamicNTKAlphaRotaryEmbedding):
     """Dynamic NTK RoPE parameterised by `alpha` instead of `factor`.
 
-    Same structure as `AscendDynamicNTKScalingRotaryEmbedding`: the alpha
-    correction is folded into `base` when the cache is built, so only the
-    forward needs the NPU kernel. Used by Hunyuan checkpoints.
+    Used by Hunyuan checkpoints.
     """
 
     def __init__(
@@ -509,28 +523,65 @@ class AscendDynamicNTKAlphaRotaryEmbedding(DynamicNTKAlphaRotaryEmbedding):
             scaling_alpha=scaling_alpha,
             dtype=dtype,
         )
-        vllm_config = get_current_vllm_config()
-        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
-        _record_cos_sin_cache(self.cos_sin_cache)
+        self._init_ascend_rope()
 
-    def forward_oot(
+
+class AscendNTKScalingRotaryEmbedding(_AscendScaledRopeMixin, NTKScalingRotaryEmbedding):
+    """Fixed and mixed NTK scaled RoPE (`rope_scaling.type == "ntk"`)."""
+
+    def __init__(
         self,
-        positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor | None,
-        offsets: torch.Tensor | None = None,
-        is_neox_style_override: bool | None = None,
-        out_dtype: torch.dtype | None = None,
-    ):
-        return AscendRotaryEmbedding.forward_oot(
-            self,
-            positions,
-            query,
-            key,
-            offsets,
-            is_neox_style_override,
-            out_dtype,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        scaling_factor: float,
+        dtype: torch.dtype,
+        mixed_b: float | None = None,
+    ) -> None:
+        super().__init__(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            scaling_factor=scaling_factor,
+            dtype=dtype,
+            mixed_b=mixed_b,
         )
+        self._init_ascend_rope()
+
+
+class AscendLlama3RotaryEmbedding(_AscendScaledRopeMixin, Llama3RotaryEmbedding):
+    """Llama 3 frequency-smoothed RoPE (`rope_scaling.type == "llama3"`)."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        scaling_factor: float,
+        low_freq_factor: float,
+        high_freq_factor: float,
+        orig_max_position: int,
+    ) -> None:
+        super().__init__(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            dtype=dtype,
+            scaling_factor=scaling_factor,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
+            orig_max_position=orig_max_position,
+        )
+        self._init_ascend_rope()
 
 
 class AscendGemma4RotaryEmbedding(Gemma4RotaryEmbedding):

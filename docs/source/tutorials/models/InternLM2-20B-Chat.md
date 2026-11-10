@@ -246,7 +246,7 @@ The command above, run against a TP=2 server started with `--max-model-len 8192 
 
 | TP | Max model len | Requests | Concurrency | Request throughput | Output throughput | Mean TTFT | Mean TPOT |
 |---:|--------------:|---------:|------------:|-------------------:|------------------:|----------:|----------:|
-| 2 | 8192 | 64 | 8 | 1.95 req/s | 250.10 tok/s | 408.5 ms | 28.9 ms |
+| 2 | 8192 | 64 | 8 | 1.96 req/s | 250.42 tok/s | 401.7 ms | 28.9 ms |
 
 ## 9 Performance Tuning
 
@@ -256,7 +256,7 @@ Please refer to the [vLLM Features](https://docs.vllm.ai/en/stable/features), [v
 
 The checkpoint declares `rope_scaling = {"type": "dynamic", "factor": 2.0}`. vLLM builds a `DynamicNTKScalingRotaryEmbedding` for it. Because the checkpoint provides no `max_trained_positions`, vLLM defaults it to `max_position_embeddings`, the NTK correction term collapses to one, and the resulting cos/sin table is identical to a plain RoPE table at theta 1,000,000. Serving at the full 32,768-token context therefore needs no additional scaling configuration.
 
-This rotary variant is dispatched to the Ascend fused rotary kernel. On releases where that dispatch is absent, the layer silently falls back to the elementwise reference implementation; nothing in the log reports the fallback, so confirm the class in use when debugging rotary behaviour on this model. Measured on two Atlas A2 devices with the workload above, the fused kernel was worth 18.7% in output throughput and 15.8% in mean time per output token, and its bf16 output was closer to an fp32 reference than the fallback at every sequence length tested.
+This rotary variant is dispatched to the Ascend fused rotary kernel. On releases where that dispatch is absent, the layer silently falls back to the elementwise reference implementation; nothing in the log reports the fallback, so confirm the class in use when debugging rotary behaviour on this model. Measured on two Atlas A2 devices with the workload above, the fused kernel was worth 15.4% in output throughput and 13.9% in mean time per output token, and its bf16 output was closer to an fp32 reference than the fallback at every sequence length tested.
 
 ### 9.2 Parallelism
 

@@ -850,7 +850,9 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         AscendDynamicNTKAlphaRotaryEmbedding,
         AscendDynamicNTKScalingRotaryEmbedding,
         AscendGemma4RotaryEmbedding,
+        AscendLlama3RotaryEmbedding,
         AscendMRotaryEmbedding,
+        AscendNTKScalingRotaryEmbedding,
         AscendRotaryEmbedding,
         AscendYaRNRotaryEmbedding,
     )
@@ -870,6 +872,8 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "MRotaryEmbedding": AscendMRotaryEmbedding,
         "DynamicNTKScalingRotaryEmbedding": AscendDynamicNTKScalingRotaryEmbedding,
         "DynamicNTKAlphaRotaryEmbedding": AscendDynamicNTKAlphaRotaryEmbedding,
+        "NTKScalingRotaryEmbedding": AscendNTKScalingRotaryEmbedding,
+        "Llama3RotaryEmbedding": AscendLlama3RotaryEmbedding,
         "ColumnParallelLinear": AscendColumnParallelLinear,
         "RowParallelLinear": AscendRowParallelLinear,
         "YaRNScalingRotaryEmbedding": AscendYaRNRotaryEmbedding,
