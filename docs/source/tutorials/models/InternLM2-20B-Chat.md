@@ -235,12 +235,14 @@ vllm bench serve \
     --dataset-name random \
     --random-input-len 1024 \
     --random-output-len 128 \
-    --num-prompts 100 \
+    --num-prompts 64 \
     --max-concurrency 8 \
     --ignore-eos
 ```
 
 Keep input length, output length, request count, and concurrency fixed when comparing configurations; results obtained under different settings are not comparable.
+
+The command above, run against a TP=2 server started with `--max-model-len 8192 --gpu-memory-utilization 0.85` on two Atlas A2 devices, gives:
 
 | TP | Max model len | Requests | Concurrency | Request throughput | Output throughput | Mean TTFT | Mean TPOT |
 |---:|--------------:|---------:|------------:|-------------------:|------------------:|----------:|----------:|

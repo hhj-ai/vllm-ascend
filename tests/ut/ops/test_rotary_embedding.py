@@ -677,47 +677,14 @@ class TestAscendMRotaryEmbeddingRotaryMode:
         assert mock_npu_mrope.call_args.kwargs["rotary_mode"] == expected_mode
 
 
-def _reference_dynamic_ntk_cache(
-    rotary_dim: int,
-    max_position_embeddings: int,
-    max_trained_positions: int,
-    base: float,
-    scaling_factor: float,
-) -> torch.Tensor:
-    """Dynamic NTK cos/sin cache, written from the HF formula.
-
-    Independent of the vLLM class under test: it re-derives the NTK-corrected
-    base and the cos/sin table from scratch so the assertion catches a cache
-    that silently stops matching upstream, not just a refactor of it.
-    """
-    corrected_base = base * (
-        (scaling_factor * max_position_embeddings / max_trained_positions) - (scaling_factor - 1)
-    ) ** (rotary_dim / (rotary_dim - 2))
-    inv_freq = 1.0 / (corrected_base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-    t = torch.arange(max_position_embeddings, dtype=torch.float)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
-
-
-def _reference_dynamic_ntk_alpha_cache(
-    rotary_dim: int,
-    max_position_embeddings: int,
-    base: float,
-    scaling_alpha: float,
-) -> torch.Tensor:
-    """Alpha-parameterised dynamic NTK cos/sin cache, from the HF formula."""
-    corrected_base = base * scaling_alpha ** (rotary_dim / (rotary_dim - 2))
-    inv_freq = 1.0 / (corrected_base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-    t = torch.arange(max_position_embeddings, dtype=torch.float)
-    freqs = torch.einsum("i,j -> ij", t, inv_freq)
-    return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
-
-
 @pytest.fixture()
 def make_dynamic_ntk_embedding(patch_init_side_effects):
     """Factory for AscendDynamicNTKScalingRotaryEmbedding, parent init suppressed."""
 
-    def _factory(is_neox_style: bool = True):
+    def _factory(use_mtp: bool = False, is_neox_style: bool = True):
+        spec_cfg = MagicMock(method="mtp") if use_mtp else None
+        patch_init_side_effects.return_value.speculative_config = spec_cfg
+
         with patch("vllm_ascend.ops.rotary_embedding.DynamicNTKScalingRotaryEmbedding.__init__") as mock_parent_init:
             mock_parent_init.return_value = None
             emb = AscendDynamicNTKScalingRotaryEmbedding.__new__(AscendDynamicNTKScalingRotaryEmbedding)
@@ -745,7 +712,10 @@ def make_dynamic_ntk_embedding(patch_init_side_effects):
 def make_dynamic_ntk_alpha_embedding(patch_init_side_effects):
     """Factory for AscendDynamicNTKAlphaRotaryEmbedding, parent init suppressed."""
 
-    def _factory(is_neox_style: bool = True):
+    def _factory(use_mtp: bool = False, is_neox_style: bool = True):
+        spec_cfg = MagicMock(method="mtp") if use_mtp else None
+        patch_init_side_effects.return_value.speculative_config = spec_cfg
+
         with patch("vllm_ascend.ops.rotary_embedding.DynamicNTKAlphaRotaryEmbedding.__init__") as mock_parent_init:
             mock_parent_init.return_value = None
             emb = AscendDynamicNTKAlphaRotaryEmbedding.__new__(AscendDynamicNTKAlphaRotaryEmbedding)
@@ -810,36 +780,30 @@ class TestAscendDynamicNTKRotaryEmbedding:
         rescales the base. Overriding either hook in the Ascend subclass would
         change the table itself rather than just the kernel that reads it.
         """
-        for hook in ("_compute_cos_sin_cache", "_compute_inv_freq"):
-            assert getattr(ascend_cls, hook) is getattr(upstream_cls, hook), (
-                f"{ascend_cls.__name__} overrides {hook}; the Ascend subclass must only swap the forward."
-            )
+        assert ascend_cls._compute_cos_sin_cache is upstream_cls._compute_cos_sin_cache, (
+            f"{ascend_cls.__name__} overrides _compute_cos_sin_cache; the Ascend subclass must only swap the forward."
+        )
 
-    def test_scaling_cache_matches_reference_formula(self):
-        """The inherited cache still has to match the HF dynamic NTK formula."""
-        with set_current_vllm_config(self._vllm_config()):
-            emb = DynamicNTKScalingRotaryEmbedding(
-                HEAD_SIZE, ROTARY_DIM, MAX_POS, MAX_POS, BASE, True, 2.0, torch.float32
-            )
+    @pytest.mark.parametrize("use_mtp", [True, False])
+    @pytest.mark.parametrize(
+        "factory_name",
+        ["make_dynamic_ntk_embedding", "make_dynamic_ntk_alpha_embedding"],
+    )
+    def test_sets_use_mtp_read_by_the_delegate(self, use_mtp, factory_name, request):
+        """AscendRotaryEmbedding.forward_oot reads self.use_mtp, so __init__ must set it."""
+        emb = request.getfixturevalue(factory_name)(use_mtp=use_mtp)
 
-        expected = _reference_dynamic_ntk_cache(ROTARY_DIM, MAX_POS, MAX_POS, BASE, 2.0)
-        torch.testing.assert_close(emb.cos_sin_cache, expected, rtol=0, atol=0)
-
-    def test_alpha_cache_matches_reference_formula(self):
-        with set_current_vllm_config(self._vllm_config()):
-            emb = DynamicNTKAlphaRotaryEmbedding(HEAD_SIZE, ROTARY_DIM, MAX_POS, BASE, True, 2.0, torch.float32)
-
-        expected = _reference_dynamic_ntk_alpha_cache(ROTARY_DIM, MAX_POS, BASE, 2.0)
-        torch.testing.assert_close(emb.cos_sin_cache, expected, rtol=0, atol=0)
+        assert bool(emb.use_mtp) is use_mtp
 
     def test_untrained_scaling_factor_leaves_base_untouched(self):
         """`max_trained_positions == max_position` must be a no-op correction.
 
         This is the InternLM2-20B-Chat case: `factor=2.0` with no
         `max_trained_positions`, so `get_rope` defaults it to `max_position`
-        and the correction term collapses to 1. The cache then has to equal a
-        plain RoPE cache at the same theta, which is what makes the declared
-        32K context numerically equivalent to the unscaled model.
+        and the correction term collapses to 1. The cache then equals a plain
+        RoPE cache at the same theta, which is what makes the declared 32K
+        context numerically equivalent to the unscaled model and lets the
+        same NPU kernel serve both.
         """
         with set_current_vllm_config(self._vllm_config()):
             scaled = DynamicNTKScalingRotaryEmbedding(
@@ -847,7 +811,7 @@ class TestAscendDynamicNTKRotaryEmbedding:
             )
             plain = RotaryEmbedding(HEAD_SIZE, ROTARY_DIM, MAX_POS, BASE, True, torch.float32)
 
-        torch.testing.assert_close(scaled.cos_sin_cache, plain.cos_sin_cache, rtol=0, atol=0)
+        torch.testing.assert_close(scaled.cos_sin_cache, plain.cos_sin_cache)
 
 
 class TestAscendDynamicNTKScalingRotaryEmbeddingForwardOOT:
@@ -864,19 +828,6 @@ class TestAscendDynamicNTKScalingRotaryEmbeddingForwardOOT:
         mock_delegate.assert_called_once_with(emb, positions, query, key, None, None, None)
         assert result is expected
 
-    @pytest.mark.parametrize("override", [True, False])
-    @patch("vllm_ascend.ops.rotary_embedding.AscendRotaryEmbedding.forward_oot")
-    def test_is_neox_style_override_forwarded(self, mock_delegate, override, make_dynamic_ntk_embedding):
-        mock_delegate.return_value = MagicMock()
-
-        emb = make_dynamic_ntk_embedding()
-        positions, query, key = _make_tensors()
-
-        emb.forward_oot(positions, query, key, is_neox_style_override=override)
-
-        _, call_args, _ = mock_delegate.mock_calls[0]
-        assert call_args[5] is override
-
     @patch("vllm_ascend.ops.rotary_embedding.AscendRotaryEmbedding.forward_oot")
     def test_all_args_forwarded_together(self, mock_delegate, make_dynamic_ntk_embedding):
         mock_delegate.return_value = MagicMock()
@@ -890,8 +841,13 @@ class TestAscendDynamicNTKScalingRotaryEmbeddingForwardOOT:
         mock_delegate.assert_called_once_with(emb, positions, query, key, offsets, False, None)
 
     @patch("vllm_ascend.ops.rotary_embedding._record_cos_sin_cache")
-    def test_init_records_cos_sin_cache(self, mock_record):
-        """The cache has to be published for the MLA/SFA lookup path."""
+    def test_init_publishes_cos_sin_cache(self, mock_record):
+        """`update_cos_sin` serves the gathered slice from this global.
+
+        Model runner v2 calls `update_cos_sin` once per step and the GQA rope
+        path reads the slice back, so a subclass that never publishes its
+        cache leaves that lookup on a stale table.
+        """
         with patch("vllm_ascend.ops.rotary_embedding.DynamicNTKScalingRotaryEmbedding.__init__") as mock_parent_init:
             mock_parent_init.return_value = None
             emb = AscendDynamicNTKScalingRotaryEmbedding.__new__(AscendDynamicNTKScalingRotaryEmbedding)

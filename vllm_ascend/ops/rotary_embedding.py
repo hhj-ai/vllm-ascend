@@ -449,22 +449,24 @@ class AscendDynamicNTKScalingRotaryEmbedding(DynamicNTKScalingRotaryEmbedding):
         dtype: torch.dtype,
     ) -> None:
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            max_trained_positions,
-            base,
-            is_neox_style,
-            scaling_factor,
-            dtype,
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            max_trained_positions=max_trained_positions,
+            base=base,
+            is_neox_style=is_neox_style,
+            scaling_factor=scaling_factor,
+            dtype=dtype,
         )
+        vllm_config = get_current_vllm_config()
+        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
         _record_cos_sin_cache(self.cos_sin_cache)
 
     def forward_oot(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         offsets: torch.Tensor | None = None,
         is_neox_style_override: bool | None = None,
         out_dtype: torch.dtype | None = None,
@@ -499,21 +501,23 @@ class AscendDynamicNTKAlphaRotaryEmbedding(DynamicNTKAlphaRotaryEmbedding):
         dtype: torch.dtype,
     ) -> None:
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            scaling_alpha,
-            dtype,
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            is_neox_style=is_neox_style,
+            scaling_alpha=scaling_alpha,
+            dtype=dtype,
         )
+        vllm_config = get_current_vllm_config()
+        self.use_mtp = vllm_config.speculative_config and vllm_config.speculative_config.method == "mtp"
         _record_cos_sin_cache(self.cos_sin_cache)
 
     def forward_oot(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         offsets: torch.Tensor | None = None,
         is_neox_style_override: bool | None = None,
         out_dtype: torch.dtype | None = None,
