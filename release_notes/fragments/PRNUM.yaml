@@ -1,0 +1,8 @@
+pr: PRNUM
+entries:
+  - category: hardware
+    text: Dynamic NTK rotary embeddings now run on the Ascend fused rotary kernel instead of falling back to the reference implementation. Models declaring `rope_scaling.type=dynamic` gain throughput and lose nothing in accuracy.
+  - category: feature
+    text: Added InternLM2-20B-Chat support, with an end-to-end accuracy configuration, two-card serving tests, and a deployment tutorial.
+    model: internlm2-chat-20b
+    hardware: [A2, A3]
